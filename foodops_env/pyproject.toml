@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foodops_env"
+version = "0.1.0"
+description = "Ambiguity-first FoodOps RL environment for OpenEnv experiments."
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "pydantic>=2.0",
+  "uvicorn>=0.23",
+]
+
+[tool.setuptools]
+packages = ["foodops_env"]
+
