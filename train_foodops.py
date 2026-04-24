@@ -193,6 +193,18 @@ def predicted_category_from_tool(tool_name: str | None) -> str:
     return "none"
 
 
+def is_malformed_action(action: Any) -> bool:
+    return isinstance(action, dict) and bool(action.get("_malformed"))
+
+
+def to_env_action(action: Any, fallback_raw: str = "") -> dict[str, Any]:
+    if isinstance(action, dict) and "tool" in action and not action.get("_malformed"):
+        return action
+    if is_malformed_action(action):
+        return {"raw": action.get("raw", fallback_raw)}
+    return {"raw": fallback_raw or json.dumps(action, default=str)}
+
+
 def random_policy(obs: dict[str, Any], rng: random.Random | None = None) -> dict[str, Any]:
     local_rng = rng or random
     brand = obs["dashboard_kpis"].get("brand")
@@ -265,12 +277,15 @@ def rollout_policy(
     obs, info = env.reset(seed=seed)
     reward_total = 0.0
     terminal_tool = None
+    malformed_actions = 0
     for _ in range(max_tool_calls):
         policy_output = policy_fn(obs)
         action = policy_output[0] if isinstance(policy_output, tuple) else policy_output
-        env_action = action if isinstance(action, dict) and "tool" in action else {"raw": json.dumps(action, default=str)}
+        env_action = to_env_action(action)
         obs, reward, terminated, truncated, _ = env.step(env_action)
         reward_total += reward
+        if env_action.get("tool") is None:
+            malformed_actions += 1
         if terminated or truncated:
             terminal_tool = env_action.get("tool")
             break
@@ -286,6 +301,7 @@ def rollout_policy(
         "disambiguated": state["phase_flags"]["disambiguated"],
         "guardrail_violation": terminal_tool in FORBIDDEN_TOOLS,
         "predicted_category": predicted_category_from_tool(terminal_tool),
+        "malformed_actions": malformed_actions,
     }
 
 
@@ -308,6 +324,7 @@ def evaluate_policy(
     ) / len(episodes)
     disambiguation_rate = sum(1 for ep in episodes if ep["disambiguated"]) / len(episodes)
     mean_steps = sum(ep["steps"] for ep in episodes) / len(episodes)
+    malformed_action_rate = sum(ep["malformed_actions"] for ep in episodes) / len(episodes)
     confusion = Counter((ep["anomaly_category"], ep["predicted_category"]) for ep in episodes)
     per_scenario: dict[str, dict[str, float]] = {}
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -334,6 +351,7 @@ def evaluate_policy(
         "correct_category_rate": correct_category_rate,
         "disambiguation_rate": disambiguation_rate,
         "mean_steps": mean_steps,
+        "mean_malformed_actions": malformed_action_rate,
         "confusion": confusion,
         "per_scenario": per_scenario,
     }
@@ -485,6 +503,7 @@ def train_reinforce(
     optimizer.zero_grad(set_to_none=True)
     running_baseline = 0.0
     metrics_log: list[dict[str, Any]] = []
+    malformed_samples: list[dict[str, Any]] = []
     total_steps = config.smoke_steps if smoke else config.training_steps
     first_debug = True
 
@@ -505,8 +524,19 @@ def train_reinforce(
                 debug_shapes=smoke and first_debug,
             )
             first_debug = False
-            env_action = action if isinstance(action, dict) and "tool" in action and not action.get("_malformed") else {"raw": action.get("raw", decoded)}
+            env_action = to_env_action(action, decoded)
             obs, reward, terminated, truncated, step_info = env.step(env_action)
+            if is_malformed_action(action) and len(malformed_samples) < 20:
+                malformed_sample = {
+                    "training_step": step,
+                    "episode_seed": episode_seed,
+                    "prompt": prompt,
+                    "decoded": decoded,
+                    "raw": action.get("raw", decoded),
+                }
+                malformed_samples.append(malformed_sample)
+                if smoke:
+                    print("Malformed action sample:", json.dumps(malformed_sample, indent=2)[:1200])
             trajectory.append(
                 {
                     "prompt": prompt,
@@ -565,6 +595,9 @@ def train_reinforce(
 
         if (not smoke) and config.checkpoint_every > 0 and (step + 1) % config.checkpoint_every == 0:
             save_checkpoint(model, tokenizer, output_dir, step + 1)
+
+    malformed_path = output_dir / "malformed_action_samples.json"
+    malformed_path.write_text(json.dumps(malformed_samples, indent=2, default=str))
 
     return metrics_log
 
@@ -701,6 +734,7 @@ def write_eval_report(
                 f"- Random mean reward: {random_metrics['mean_reward']:+.3f}",
                 f"- Trained mean reward: {trained_metrics['mean_reward']:+.3f}",
                 f"- Heuristic mean reward: {heuristic_metrics['mean_reward']:+.3f}",
+                f"- Trained mean malformed actions: {trained_metrics['mean_malformed_actions']:.2f}",
                 f"- Trained disambiguation rate: {trained_metrics['disambiguation_rate']:.2%}",
                 f"- Trained guardrail violation rate: {trained_metrics['guardrail_violation_rate']:.2%}",
                 "",

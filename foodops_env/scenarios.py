@@ -177,8 +177,6 @@ def _inject_stuck_promo(world: WorldState, params: dict[str, Any]) -> None:
     current["net_sales"] = round(max(0.0, baseline["net_sales"] - (baseline["net_payout"] * drop_pct * 0.9)), 2)
     current["net_payout"] = round(baseline["net_payout"] * (1.0 - drop_pct), 2)
     current["aov"] = round(current["gross_sales"] / max(current["total_orders"], 1), 2)
-    current["anomaly_marker"] = "stuck_promo"
-
     _rebuild_recent_orders(
         world,
         brand,
@@ -210,8 +208,6 @@ def _inject_stale_menu_sync(world: WorldState, params: dict[str, Any]) -> None:
     current["net_sales"] = round(baseline["net_sales"] * (1.0 - drop_pct * 0.7), 2)
     current["net_payout"] = round(baseline["net_payout"] * (1.0 - drop_pct), 2)
     current["discount_amount"] = round(max(0.0, current["gross_sales"] - current["net_sales"]), 2)
-    current["anomaly_marker"] = "stale_menu_sync"
-
     _rebuild_recent_orders(
         world,
         brand,
@@ -243,8 +239,6 @@ def _inject_commission_drift(world: WorldState, params: dict[str, Any]) -> None:
     current["net_payout"] = round(baseline["net_payout"] * (1.0 - drop_pct), 2)
     current["aov"] = round(current["gross_sales"] / max(current["total_orders"], 1), 2)
     current["effective_commission_pct"] = config["effective_commission_pct"]
-    current["anomaly_marker"] = "commission_drift"
-
     _rebuild_recent_orders(
         world,
         brand,
@@ -355,4 +349,3 @@ def sample_scenario(rng: random.Random) -> ScenarioInstance:
     """Sample one of the three scenario families uniformly."""
     template = rng.choice(SCENARIO_TEMPLATES)
     return build_scenario_instance(template, rng)
-

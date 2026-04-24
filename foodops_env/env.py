@@ -40,6 +40,7 @@ from .scenarios import (
 
 
 MAX_STEPS = 12
+MAX_INVALID_ACTION_STREAK = 3
 DEFAULT_NOW = datetime(2026, 4, 24, 10, 0, 0)
 
 
@@ -68,6 +69,7 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
         self.step_count = 0
         self.done = False
         self.terminated_reason = ""
+        self.invalid_action_streak = 0
         self.last_tool_call: dict[str, Any] | None = None
         self.last_tool_result: dict[str, Any] | None = None
 
@@ -78,6 +80,7 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
         self.step_count = 0
         self.done = False
         self.terminated_reason = ""
+        self.invalid_action_streak = 0
         self.trajectory = []
         self.phase_flags = {
             "has_read": False,
@@ -98,6 +101,7 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
             "scenario_id": self.anomaly.scenario_id,
             "anomaly_category": self.anomaly.anomaly_category,
             "story_seed": self.anomaly.story_seed,
+            "scenario_params": deepcopy(self.anomaly.params),
         }
         return obs, info
 
@@ -110,7 +114,12 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
 
         self.step_count += 1
         if not isinstance(action, dict) or "tool" not in action:
-            malformed_result = {"error": "malformed action"}
+            self.invalid_action_streak += 1
+            malformed_result = {
+                "error": "malformed action",
+                "raw": action.get("raw", "") if isinstance(action, dict) else str(action),
+                "invalid_action_streak": self.invalid_action_streak,
+            }
             self.last_tool_call = action if isinstance(action, dict) else {"tool": None, "args": {}}
             self.last_tool_result = malformed_result
             reward_breakdown = compute_step_breakdown(
@@ -121,13 +130,69 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
                 phase_flags=self.phase_flags,
                 malformed=True,
             )
-            info = {"reward_breakdown": reward_breakdown, "terminated_reason": ""}
-            return self._observation(), reward_breakdown["total"], False, False, info
+            terminated = self.invalid_action_streak >= MAX_INVALID_ACTION_STREAK
+            if terminated:
+                self.terminated_reason = "too_many_invalid_actions"
+            self.trajectory.append(
+                {
+                    "tool": "__malformed__",
+                    "args": {},
+                    "result": deepcopy(malformed_result),
+                    "step_reward": reward_breakdown["total"],
+                    "reward_breakdown": reward_breakdown,
+                }
+            )
+            self.done = terminated
+            info = {
+                "reward_breakdown": reward_breakdown,
+                "terminated_reason": self.terminated_reason,
+                "invalid_action_streak": self.invalid_action_streak,
+            }
+            return self._observation(), reward_breakdown["total"], terminated, False, info
 
         tool_name = str(action.get("tool"))
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
         normalized_action = {"tool": tool_name, "args": args}
         tool_result = self._dispatch_tool(tool_name, args)
+
+        if tool_result.get("error") == "unknown tool":
+            self.invalid_action_streak += 1
+            invalid_result = {
+                "error": "unknown tool",
+                "tool": tool_name,
+                "invalid_action_streak": self.invalid_action_streak,
+            }
+            self.last_tool_call = normalized_action
+            self.last_tool_result = invalid_result
+            reward_breakdown = compute_step_breakdown(
+                action=None,
+                tool_result=invalid_result,
+                scenario=self.anomaly,
+                trajectory=self.trajectory,
+                phase_flags=self.phase_flags,
+                malformed=True,
+            )
+            terminated = self.invalid_action_streak >= MAX_INVALID_ACTION_STREAK
+            if terminated:
+                self.terminated_reason = "too_many_invalid_actions"
+            self.trajectory.append(
+                {
+                    "tool": "__unknown__",
+                    "args": deepcopy(args),
+                    "result": deepcopy(invalid_result),
+                    "step_reward": reward_breakdown["total"],
+                    "reward_breakdown": reward_breakdown,
+                }
+            )
+            self.done = terminated
+            info = {
+                "reward_breakdown": reward_breakdown,
+                "terminated_reason": self.terminated_reason,
+                "invalid_action_streak": self.invalid_action_streak,
+            }
+            return self._observation(), reward_breakdown["total"], terminated, False, info
+
+        self.invalid_action_streak = 0
 
         reward_breakdown = compute_step_breakdown(
             action=normalized_action,
@@ -214,6 +279,7 @@ class FoodOpsEnv(gym.Env):  # type: ignore[misc]
             "step_count": self.step_count,
             "done": self.done,
             "terminated_reason": self.terminated_reason,
+            "invalid_action_streak": self.invalid_action_streak,
         }
 
     def _observation(self) -> dict[str, Any]:
