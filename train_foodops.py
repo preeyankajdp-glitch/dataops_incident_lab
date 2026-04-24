@@ -68,7 +68,7 @@ class TrainingConfig:
     max_tool_calls_per_episode: int = 12
     learning_rate: float = 1e-5
     max_new_tokens: int = 64
-    temperature: float = 0.2
+    temperature: float = 0.8
     baseline_ema: float = 0.9
     eval_seeds: list[int] = field(default_factory=lambda: list(range(1000, 1006)))
     checkpoint_every: int = 50
@@ -618,6 +618,8 @@ def qwen_policy(
     )
     full_decoded = ACTION_PREFIX + decoded
     action = parse_action(full_decoded)
+    if is_malformed_action(action):
+        action = parse_action(decoded)
     return action, response_ids, full_decoded, prompt
 
 
