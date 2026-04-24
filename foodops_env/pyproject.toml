@@ -16,3 +16,5 @@ dependencies = [
 [tool.setuptools]
 packages = ["foodops_env"]
 
+[tool.setuptools.package-dir]
+"" = ".."
