@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from foodops_env.env import FoodOpsEnv
 from foodops_env.reward import ESCALATION_TOOLS, FORBIDDEN_TOOLS, WRITE_TOOLS
+from foodops_env.primitives import PRIMITIVES
 
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
@@ -39,8 +40,10 @@ You must output exactly one valid JSON tool call.
 No prose. No markdown. No explanation.
 
 Rules:
-- Use one tool only.
-- Investigate with a read tool before acting.
+- Use one tool only per step.
+- Investigate with read tools before acting.
+- Some incidents have multiple root causes — fix each one.
+- If the world state may have changed, re-check before deciding.
 - Never change commission rates, promo flags, or menu prices directly.
 
 Valid format:
@@ -50,6 +53,8 @@ More valid examples:
 {"tool": "check_pipeline_freshness", "args": {"table_name": "menu_sync", "brand": "Behrouz Biryani", "channel": "Swiggy"}}
 {"tool": "force_menu_sync", "args": {"brand": "Behrouz Biryani", "channel": "Swiggy"}}
 {"tool": "escalate_to_finance", "args": {"reason": "Commission drift above baseline."}}
+{"tool": "inspect_recent_orders", "args": {"brand": "Faasos", "channel": "Zomato", "limit": 10}}
+{"tool": "restart_pipeline", "args": {"pipeline_name": "orders_ingest"}}
 """
 
 
@@ -274,17 +279,18 @@ def choose_heuristic_action(obs: dict[str, Any]) -> dict[str, Any]:
     brand = obs["dashboard_kpis"]["brand"]
     channel = obs["dashboard_kpis"]["channel"]
     last_tool = (obs["last_tool_call"] or {}).get("tool")
+    result = obs["last_tool_result"] or {}
+    tools_used = set()
+    # Build history of tools used from the trajectory (via observation chain)
+    if last_tool:
+        tools_used.add(last_tool)
 
     if last_tool is None:
-        if any(token in complaint for token in ["week", "month", "expected", "lower than last month"]):
-            return {"tool": "get_kpi_summary", "args": {"brand": brand, "channel": channel, "range": "baseline"}}
-        return {"tool": "check_config", "args": {"brand": brand, "channel": channel}}
-
-    if last_tool == "get_kpi_summary":
         return {"tool": "check_config", "args": {"brand": brand, "channel": channel}}
 
     if last_tool == "check_config":
-        result = obs["last_tool_result"] or {}
+        if result.get("is_live") is False:
+            return {"tool": "escalate_to_ops", "args": {"reason": "Brand is paused on this channel."}}
         if result.get("promo_active"):
             return {"tool": "escalate_to_finance", "args": {"reason": "Promo appears stuck on the target pair."}}
         if float(result.get("effective_commission_pct", 0.0)) > float(result.get("baseline_commission_pct", 0.0)):
@@ -292,10 +298,34 @@ def choose_heuristic_action(obs: dict[str, Any]) -> dict[str, Any]:
         return {"tool": "check_pipeline_freshness", "args": {"table_name": "menu_sync", "brand": brand, "channel": channel}}
 
     if last_tool == "check_pipeline_freshness":
-        result = obs["last_tool_result"] or {}
         if result.get("is_stale"):
-            return {"tool": "force_menu_sync", "args": {"brand": brand, "channel": channel}}
-        return {"tool": "escalate_to_ops", "args": {"reason": "No obvious config issue; asking ops to verify state."}}
+            table = result.get("table_name", "")
+            if table == "menu_sync":
+                return {"tool": "force_menu_sync", "args": {"brand": brand, "channel": channel}}
+            return {"tool": "restart_pipeline", "args": {"pipeline_name": table or "orders_ingest"}}
+        return {"tool": "inspect_recent_orders", "args": {"brand": brand, "channel": channel, "limit": 10}}
+
+    if last_tool == "inspect_recent_orders":
+        rows = result.get("rows", [])
+        if not rows:
+            return {"tool": "restart_pipeline", "args": {"pipeline_name": "orders_ingest"}}
+        if any(str(r.get("order_id", "")).endswith("-DUP") or r.get("is_duplicate") for r in rows):
+            return {"tool": "restart_pipeline", "args": {"pipeline_name": "dedup"}}
+        if any(r.get("status") == "refunded" for r in rows):
+            refund_rate = sum(1 for r in rows if r.get("status") == "refunded") / len(rows)
+            if refund_rate > 0.10:
+                return {"tool": "escalate_to_ops", "args": {"reason": f"High refund rate ({refund_rate:.0%})."}}
+        return {"tool": "escalate_to_ops", "args": {"reason": "No obvious issue found in recent orders."}}
+
+    if last_tool == "get_kpi_summary":
+        return {"tool": "check_config", "args": {"brand": brand, "channel": channel}}
+
+    if last_tool in ("force_menu_sync", "restart_pipeline"):
+        # After a remediation, check if more issues remain
+        pending = obs.get("pending_resolutions", 0)
+        if pending and pending > 0:
+            return {"tool": "check_config", "args": {"brand": brand, "channel": channel}}
+        return {"tool": "escalate_to_ops", "args": {"reason": "Pipeline remediated, verifying state."}}
 
     return {"tool": "escalate_to_ops", "args": {"reason": "Unable to disambiguate confidently."}}
 
@@ -326,6 +356,9 @@ def rollout_policy(
         "seed": seed,
         "scenario_id": info["scenario_id"],
         "anomaly_category": info["anomaly_category"],
+        "difficulty": info.get("difficulty", "easy"),
+        "is_compound": info.get("is_compound", False),
+        "has_drift": info.get("has_drift", False),
         "reward_total": reward_total,
         "steps": len(state["trajectory"]),
         "trajectory": state["trajectory"],
@@ -376,6 +409,18 @@ def evaluate_policy(
             ) / len(rows),
             "disambiguation_rate": sum(1 for row in rows if row["disambiguated"]) / len(rows),
         }
+
+    per_difficulty: dict[str, dict[str, float]] = {}
+    diff_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for episode in episodes:
+        diff_grouped[episode["difficulty"]].append(episode)
+    for difficulty, rows in diff_grouped.items():
+        per_difficulty[difficulty] = {
+            "count": len(rows),
+            "mean_reward": sum(row["reward_total"] for row in rows) / len(rows),
+            "disambiguation_rate": sum(1 for row in rows if row["disambiguated"]) / len(rows),
+        }
+
     return {
         "episodes": episodes,
         "mean_reward": mean_reward,
@@ -386,6 +431,7 @@ def evaluate_policy(
         "mean_malformed_actions": malformed_action_rate,
         "confusion": confusion,
         "per_scenario": per_scenario,
+        "per_difficulty": per_difficulty,
     }
 
 
@@ -762,7 +808,7 @@ def plot_training_outputs(
     plt.savefig(bars_plot)
     plt.close()
 
-    labels = ["pipeline", "business"]
+    labels = ["pipeline", "business", "financial", "compound", "none"]
     pred_labels = ["remediate", "escalate", "forbidden", "none"]
     before_matrix = [[random_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
     after_matrix = [[trained_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
@@ -838,6 +884,9 @@ def write_eval_report(
                 "",
                 "Per-scenario trained metrics:",
                 json.dumps(trained_metrics["per_scenario"], indent=2),
+                "",
+                "Per-difficulty trained metrics:",
+                json.dumps(trained_metrics.get("per_difficulty", {}), indent=2),
             ]
         )
     )
