@@ -1,0 +1,36 @@
+{
+  "runs": [
+    {
+      "timestamp": "2026-04-24T09:12:00",
+      "action": "reset_baseline",
+      "message": "Rebuilt the FoodOps baseline with seed 20260424.",
+      "details": {
+        "seed": 20260424
+      }
+    },
+    {
+      "timestamp": "2026-04-24T09:12:00",
+      "action": "scenario",
+      "message": "Dropped Zomato rows from the aggregate after a partial refresh.",
+      "details": {
+        "target_date": "2026-04-24"
+      }
+    },
+    {
+      "timestamp": "2026-04-24T09:12:00",
+      "action": "pipeline_failure",
+      "message": "The refresh only completed part-way; Zomato partitions are missing from channel_daily_metrics.",
+      "details": {
+        "target_date": "2026-04-24"
+      }
+    },
+    {
+      "timestamp": "2026-04-24T09:15:03",
+      "action": "run_sql",
+      "message": "Assistant executed ad hoc SQL for inspection.",
+      "details": {
+        "query": "select * from channels limit 20"
+      }
+    }
+  ]
+}

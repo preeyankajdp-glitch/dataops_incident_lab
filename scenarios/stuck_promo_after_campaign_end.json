@@ -1,0 +1,174 @@
+{
+  "$schema": "./scenario.schema.json",
+  "scenario_id": "stuck_promo_after_campaign_end",
+  "scenario_family": "business_config_drift",
+  "version": "1.0.0",
+  "difficulty": "medium",
+  "is_null_incident": false,
+  "tags": ["promo", "discount_drift", "single_brand_channel", "operational_not_pipeline"],
+
+  "narrative_for_humans": {
+    "summary": "Ops ran a 15% Diwali promo for Behrouz on Swiggy. Promo was supposed to end 7 days ago. Nobody flipped the flag. Discounts keep applying, net sales and payout look wrong, but the pipeline is healthy — this is an ops problem, not a data problem.",
+    "why_this_is_interesting": "Indistinguishable from a pipeline bug on the dashboard. A naive agent will blame the pipeline. A good agent will inspect the config table and realize the data is correct."
+  },
+
+  "world_state": {
+    "description": "Hidden from the agent. Used by the environment to set up DuckDB state at reset().",
+    "baseline": {
+      "baseline_days": 30,
+      "baseline_orders_per_day_mean": 180,
+      "baseline_orders_per_day_std": 25,
+      "baseline_aov_inr": 420,
+      "baseline_refund_rate_pct": 2.1
+    },
+    "initial_config_overrides": {
+      "channel_brand_config": [
+        {
+          "brand_name": "{{brand}}",
+          "channel_name": "{{channel}}",
+          "is_live": true,
+          "promo_active": true,
+          "promo_discount_pct": "{{promo_discount_pct}}",
+          "promo_started_at": "T-{{promo_days_running}} days",
+          "promo_intended_end_at": "T-{{days_overdue}} days",
+          "effective_commission_pct": 22,
+          "menu_last_synced_at": "T-1 days",
+          "notes": null
+        }
+      ]
+    },
+    "pipeline_state": {
+      "aggregation_job_status": "success",
+      "aggregation_lag_hours": 1,
+      "schema_drift": false,
+      "raw_vs_aggregate_consistent": true,
+      "injected_log_noise": false
+    },
+    "injected_data_behavior": {
+      "description": "Last {{days_overdue}} days of orders for (brand, channel) carry the stale promo discount. All other combos behave normally.",
+      "affected_brand_channel_pairs": [
+        ["{{brand}}", "{{channel}}"]
+      ],
+      "effect": {
+        "discount_amount_multiplier": 1.0,
+        "note": "Discounts are numerically correct given current config — the config itself is the bug."
+      }
+    }
+  },
+  "observation": {
+    "user_role": "Operations lead",
+    "user_complaint": "Net payout for Behrouz on Swiggy looks way down this past week even though orders are steady. Discounts look bigger than expected. Is the pipeline broken or is this real?",
+    "shown_kpis": ["total_orders", "gross_sales", "discount_amount", "net_sales", "net_payout"],
+    "shown_time_range": "last_14_days"
+  },
+
+  "parameterization": {
+    "description": "Sampled fresh each episode with a seed. Gives training variance without rewriting scenarios.",
+    "brand": {
+      "type": "categorical",
+      "pool": ["Behrouz Biryani", "Oven Story", "Faasos", "Sweet Truth", "The Good Bowl"]
+    },
+    "channel": {
+      "type": "categorical",
+      "pool": ["Swiggy", "Zomato"]
+    },
+    "promo_discount_pct": {
+      "type": "int_range",
+      "min": 10,
+      "max": 25
+    },
+    "promo_days_running": {
+      "type": "int_range",
+      "min": 10,
+      "max": 21
+    },
+    "days_overdue": {
+      "type": "int_range",
+      "min": 3,
+      "max": 14
+    }
+  },
+
+  "ground_truth": {
+    "description": "Hidden. Used only by the reward function after episode termination.",
+    "true_root_cause": "business_config_drift",
+    "root_cause_subtype": "stale_promo_flag",
+    "is_pipeline_incident": false,
+    "requires_pipeline_action": false,
+    "correct_terminal_action": "submit_report_no_fix",
+    "true_affected_kpis": ["discount_amount", "net_sales", "net_payout"],
+    "true_affected_scope": {
+      "brands": ["{{brand}}"],
+      "channels": ["{{channel}}"],
+      "dimension_note": "Anomaly is isolated to one brand-channel pair. Other combos are healthy."
+    },
+    "relevant_tools": [
+      "run_sql",
+      "get_kpi_value"
+    ],
+    "required_evidence": [
+      {
+        "id": "observed_promo_flag_on",
+        "description": "Agent must query channel_brand_config and observe promo_active=true for the affected pair.",
+        "check": "any_tool_call_matches",
+        "matcher": {
+          "tool": "run_sql",
+          "must_reference_table": "channel_brand_config",
+          "must_filter_brand_channel": true
+        }
+      },
+      {
+        "id": "checked_pipeline_health",
+        "description": "Agent should at least glance at pipeline signals to rule out a data bug. Credit for either of these.",
+        "check": "any_tool_call_matches_any",
+        "matchers": [
+          {"tool": "inspect_pipeline_logs"},
+          {"tool": "check_raw_vs_aggregate_date"}
+        ]
+      }
+    ],
+    "incorrect_terminal_actions_with_reason": [
+      {"action": "refresh_aggregation", "reason": "Data is already fresh. This wastes an operation and doesn't fix anything."},
+      {"action": "report_cause=stale_aggregate", "reason": "False positive. Pipeline is healthy."},
+      {"action": "report_cause=schema_drift", "reason": "No schema change occurred."}
+    ],
+    "trap_signals": [
+      {
+        "signal": "discount_amount_spike",
+        "plausible_wrong_interpretation": "Agent may assume a data double-count or bad join.",
+        "disambiguating_check": "Gross sales are consistent with order volume; only discount and net move. Raw rows match aggregate row counts."
+      }
+    ]
+  },
+
+  "reward_config": {
+    "description": "Overrides for the default reward weights for this scenario type. Null-incident scenarios reweight toward not-making-it-worse rather than fixing.",
+    "weights": {
+      "root_cause": 0.50,
+      "tool_coverage": 0.15,
+      "tool_order": 0.10,
+      "grounded_kpis": 0.10,
+      "not_premature": 0.10,
+      "correct_no_op_bonus": 0.05
+    },
+    "penalties": {
+      "hallucination_pen": 0.30,
+      "premature_submit_pen": 0.20,
+      "unnecessary_mutation_pen": 0.25
+    }
+  },
+
+  "episode_config": {
+    "max_tool_calls": 10,
+    "timeout_seconds": 120,
+    "terminal_tools": ["submit_incident_report"]
+  },
+
+  "authoring_notes_for_codex": {
+    "naming": "scenario_id is snake_case, matches the filename. scenario_family groups related scenarios.",
+    "placeholders": "Anything inside {{double_braces}} is resolved at reset() time from the parameterization block.",
+    "strict_split": "Nothing in world_state, ground_truth, or authoring_notes_for_codex is ever shown to the agent. Only observation.* is shown.",
+    "null_incidents": "If is_null_incident=true, correct_terminal_action must be submit_report_no_fix or similar no-op, and incorrect_terminal_actions must include any mutation.",
+    "compound_scenarios": "For scenarios with multiple true causes, true_root_cause becomes a list and root_cause scoring becomes proportional. See compound_promo_plus_menu_sync.json for reference."
+  }
+}

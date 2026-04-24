@@ -1,0 +1,152 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FoodOps Incident Lab — Scenario",
+  "description": "Every scenario authored for training or evaluation must validate against this schema.",
+  "type": "object",
+  "required": [
+    "scenario_id",
+    "scenario_family",
+    "difficulty",
+    "is_null_incident",
+    "world_state",
+    "observation",
+    "ground_truth",
+    "episode_config"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Snake case. Matches filename."
+    },
+    "scenario_family": {
+      "type": "string",
+      "enum": [
+        "pipeline_failure",
+        "business_config_drift",
+        "cross_table_join_bug",
+        "external_business_reality",
+        "compound",
+        "null_incident"
+      ]
+    },
+    "version": {"type": "string"},
+    "difficulty": {
+      "type": "string",
+      "enum": ["easy", "medium", "hard", "very_hard"]
+    },
+    "is_null_incident": {
+      "type": "boolean",
+      "description": "True if the correct answer is 'nothing is broken in the data pipeline.'"
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+
+    "narrative_for_humans": {
+      "type": "object",
+      "properties": {
+        "summary": {"type": "string"},
+        "why_this_is_interesting": {"type": "string"}
+      }
+    },
+
+    "world_state": {
+      "type": "object",
+      "description": "HIDDEN FROM AGENT. World setup for reset().",
+      "required": ["baseline", "pipeline_state"],
+      "properties": {
+        "baseline": {"type": "object"},
+        "initial_config_overrides": {"type": "object"},
+        "pipeline_state": {
+          "type": "object",
+          "required": ["aggregation_job_status", "schema_drift", "raw_vs_aggregate_consistent"],
+          "properties": {
+            "aggregation_job_status": {
+              "type": "string",
+              "enum": ["success", "partial", "failed", "stale"]
+            },
+            "aggregation_lag_hours": {"type": "number"},
+            "schema_drift": {"type": "boolean"},
+            "raw_vs_aggregate_consistent": {"type": "boolean"},
+            "injected_log_noise": {"type": "boolean"}
+          }
+        },
+        "injected_data_behavior": {"type": "object"}
+      }
+    },
+
+    "observation": {
+      "type": "object",
+      "description": "THE ONLY THING AGENT SEES.",
+      "required": ["user_complaint"],
+      "properties": {
+        "user_role": {"type": "string"},
+        "user_complaint": {"type": "string"},
+        "shown_kpis": {"type": "array", "items": {"type": "string"}},
+        "shown_time_range": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+
+    "parameterization": {
+      "type": "object",
+      "description": "Sampled per episode for variance."
+    },
+
+    "ground_truth": {
+      "type": "object",
+      "description": "HIDDEN. Used by reward function only.",
+      "required": [
+        "true_root_cause",
+        "is_pipeline_incident",
+        "correct_terminal_action",
+        "true_affected_kpis",
+        "relevant_tools"
+      ],
+      "properties": {
+        "true_root_cause": {
+          "oneOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}}
+          ]
+        },
+        "root_cause_subtype": {"type": "string"},
+        "is_pipeline_incident": {"type": "boolean"},
+        "requires_pipeline_action": {"type": "boolean"},
+        "correct_terminal_action": {
+          "type": "string",
+          "enum": [
+            "submit_report_no_fix",
+            "submit_report_after_refresh",
+            "submit_report_after_schema_fix",
+            "submit_report_multi_cause"
+          ]
+        },
+        "true_affected_kpis": {"type": "array", "items": {"type": "string"}},
+        "true_affected_scope": {"type": "object"},
+        "relevant_tools": {"type": "array", "items": {"type": "string"}},
+        "required_evidence": {"type": "array"},
+        "incorrect_terminal_actions_with_reason": {"type": "array"},
+        "trap_signals": {"type": "array"}
+      }
+    },
+
+    "reward_config": {"type": "object"},
+
+    "episode_config": {
+      "type": "object",
+      "required": ["max_tool_calls", "terminal_tools"],
+      "properties": {
+        "max_tool_calls": {"type": "integer", "minimum": 3, "maximum": 20},
+        "timeout_seconds": {"type": "integer"},
+        "terminal_tools": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+
+    "authoring_notes_for_codex": {"type": "object"}
+  },
+  "additionalProperties": false
+}
