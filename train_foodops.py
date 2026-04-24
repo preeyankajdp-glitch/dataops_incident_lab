@@ -32,20 +32,24 @@ from foodops_env.reward import ESCALATION_TOOLS, FORBIDDEN_TOOLS, WRITE_TOOLS
 
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-SYSTEM_PROMPT = """You are an ops analyst for FoodOps, a food delivery company operating
-multiple brands across Zomato, Swiggy, ONDC, and Own App.
+ACTION_PREFIX = '{"tool": "'
+SYSTEM_PROMPT = """You are a FoodOps incident analyst.
 
-A user complaint will appear. Your job: investigate using the available
-tools, then take one terminal action — either remediate (fix the pipeline)
-or escalate (hand off to the right team).
+You must output exactly one valid JSON tool call.
+No prose. No markdown. No explanation.
 
 Rules:
-- Always investigate with a read tool before acting.
-- You do not have authority to change commission rates, toggle promos,
-  or edit menu prices. Those are business decisions — escalate them.
+- Use one tool only.
+- Investigate with a read tool before acting.
+- Never change commission rates, promo flags, or menu prices directly.
 
-Respond with JSON only: {"tool": "...", "args": {...}}
-One tool per response.
+Valid format:
+{"tool": "check_config", "args": {"brand": "Behrouz Biryani", "channel": "Swiggy"}}
+
+More valid examples:
+{"tool": "check_pipeline_freshness", "args": {"table_name": "menu_sync", "brand": "Behrouz Biryani", "channel": "Swiggy"}}
+{"tool": "force_menu_sync", "args": {"brand": "Behrouz Biryani", "channel": "Swiggy"}}
+{"tool": "escalate_to_finance", "args": {"reason": "Commission drift above baseline."}}
 """
 
 
@@ -146,16 +150,44 @@ def build_prompt(tokenizer: Any, obs: dict[str, Any]) -> str:
         {"role": "user", "content": user_prompt},
     ]
     if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return f"{SYSTEM_PROMPT}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + ACTION_PREFIX
+    return f"{SYSTEM_PROMPT}\n\nUser:\n{user_prompt}\n\nAssistant:\n{ACTION_PREFIX}"
+
+
+def _sanitize_last_tool_call(last_tool_call: Any) -> Any:
+    if not isinstance(last_tool_call, dict):
+        return last_tool_call
+    if "raw" in last_tool_call and "tool" not in last_tool_call:
+        return {"status": "invalid_previous_action"}
+    return {key: value for key, value in last_tool_call.items() if key != "raw"}
+
+
+def _sanitize_last_tool_result(last_tool_result: Any) -> Any:
+    if not isinstance(last_tool_result, dict):
+        return last_tool_result
+    sanitized = dict(last_tool_result)
+    if "error" in sanitized:
+        sanitized.pop("raw", None)
+    return sanitized
 
 
 def format_observation(obs: dict[str, Any]) -> str:
+    dashboard = obs["dashboard_kpis"]
+    compact_dashboard = {
+        "brand": dashboard.get("brand"),
+        "channel": dashboard.get("channel"),
+        "net_payout": dashboard.get("net_payout"),
+        "gross_sales": dashboard.get("gross_sales"),
+        "discount_amount": dashboard.get("discount_amount"),
+        "effective_commission_pct": dashboard.get("effective_commission_pct"),
+        "aov": dashboard.get("aov"),
+        "total_orders": dashboard.get("total_orders"),
+    }
     return (
         f"Complaint: {obs['user_complaint']}\n"
-        f"Dashboard KPIs: {json.dumps(obs['dashboard_kpis'], sort_keys=True)}\n"
-        f"Last tool call: {json.dumps(obs['last_tool_call'], sort_keys=True)}\n"
-        f"Last tool result: {json.dumps(obs['last_tool_result'], sort_keys=True)}\n"
+        f"Dashboard KPIs: {json.dumps(compact_dashboard, sort_keys=True)}\n"
+        f"Last tool call: {json.dumps(_sanitize_last_tool_call(obs['last_tool_call']), sort_keys=True)}\n"
+        f"Last tool result: {json.dumps(_sanitize_last_tool_result(obs['last_tool_result']), sort_keys=True)}\n"
         f"Steps remaining: {obs['steps_remaining']}\n"
         f"Tools available: {', '.join(obs['tools_available'])}"
     )
@@ -434,7 +466,7 @@ def make_model_policy(model: torch.nn.Module, tokenizer: Any, config: TrainingCo
                 do_sample=False,
             )
         generated_ids = generated[:, input_ids.shape[1] :]
-        decoded = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        decoded = ACTION_PREFIX + tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         return parse_action(decoded)
 
     return _policy
@@ -538,8 +570,9 @@ def qwen_policy(
         sample=sample,
         debug_shapes=debug_shapes,
     )
-    action = parse_action(decoded)
-    return action, response_ids, decoded, prompt
+    full_decoded = ACTION_PREFIX + decoded
+    action = parse_action(full_decoded)
+    return action, response_ids, full_decoded, prompt
 
 
 def save_checkpoint(model: torch.nn.Module, tokenizer: Any, output_dir: Path, step: int) -> None:
@@ -849,7 +882,7 @@ def main() -> None:
         tokenizer,
         config,
         eval_seeds,
-        sample=True,
+        sample=False,
     )
     benchmark_path = output_dir / "action_format_benchmark.json"
     benchmark_path.write_text(json.dumps(action_benchmark, indent=2, default=str))
