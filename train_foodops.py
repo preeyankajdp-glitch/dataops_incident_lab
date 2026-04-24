@@ -59,7 +59,7 @@ class TrainingConfig:
     max_tool_calls_per_episode: int = 12
     learning_rate: float = 1e-5
     max_new_tokens: int = 64
-    temperature: float = 0.7
+    temperature: float = 0.2
     baseline_ema: float = 0.9
     eval_seeds: list[int] = field(default_factory=lambda: list(range(1000, 1006)))
     checkpoint_every: int = 50
@@ -354,6 +354,66 @@ def evaluate_policy(
         "mean_malformed_actions": malformed_action_rate,
         "confusion": confusion,
         "per_scenario": per_scenario,
+    }
+
+
+def benchmark_action_format(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    config: TrainingConfig,
+    seeds: list[int],
+    *,
+    sample: bool,
+    max_examples: int = 10,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    malformed_count = 0
+    valid_json_count = 0
+    valid_tool_count = 0
+
+    for seed in seeds:
+        env = FoodOpsEnv()
+        obs, info = env.reset(seed=seed)
+        action, _, decoded, prompt = qwen_policy(
+            obs,
+            model,
+            tokenizer,
+            config,
+            sample=sample,
+            debug_shapes=False,
+        )
+        is_malformed = is_malformed_action(action)
+        valid_json = not is_malformed
+        tool_name = action.get("tool") if isinstance(action, dict) else None
+        valid_tool = valid_json and tool_name in obs["tools_available"]
+        malformed_count += int(is_malformed)
+        valid_json_count += int(valid_json)
+        valid_tool_count += int(valid_tool)
+
+        if len(rows) < max_examples:
+            rows.append(
+                {
+                    "seed": seed,
+                    "scenario_id": info["scenario_id"],
+                    "brand": obs["dashboard_kpis"].get("brand"),
+                    "channel": obs["dashboard_kpis"].get("channel"),
+                    "valid_json": valid_json,
+                    "valid_tool": valid_tool,
+                    "tool": tool_name,
+                    "decoded": decoded,
+                    "raw": action.get("raw", decoded) if isinstance(action, dict) else decoded,
+                    "prompt": prompt,
+                }
+            )
+
+    total = max(1, len(seeds))
+    return {
+        "sample": sample,
+        "seed_count": len(seeds),
+        "valid_json_rate": valid_json_count / total,
+        "valid_tool_rate": valid_tool_count / total,
+        "malformed_rate": malformed_count / total,
+        "examples": rows,
     }
 
 
@@ -695,6 +755,7 @@ def write_eval_report(
     random_metrics: dict[str, Any],
     trained_metrics: dict[str, Any],
     heuristic_metrics: dict[str, Any],
+    action_benchmark: dict[str, Any],
     reward_rows: list[dict[str, Any]],
     output_dir: Path,
 ) -> None:
@@ -714,6 +775,7 @@ def write_eval_report(
                 "random": _json_safe(random_metrics),
                 "trained": _json_safe(trained_metrics),
                 "heuristic": _json_safe(heuristic_metrics),
+                "pretrain_action_format": action_benchmark,
                 "training": {
                     "steps": len(reward_rows),
                     "best_reward": max((row["mean_reward"] for row in reward_rows), default=0.0),
@@ -734,6 +796,9 @@ def write_eval_report(
                 f"- Random mean reward: {random_metrics['mean_reward']:+.3f}",
                 f"- Trained mean reward: {trained_metrics['mean_reward']:+.3f}",
                 f"- Heuristic mean reward: {heuristic_metrics['mean_reward']:+.3f}",
+                f"- Pre-train valid JSON rate: {action_benchmark['valid_json_rate']:.2%}",
+                f"- Pre-train valid tool rate: {action_benchmark['valid_tool_rate']:.2%}",
+                f"- Pre-train malformed rate: {action_benchmark['malformed_rate']:.2%}",
                 f"- Trained mean malformed actions: {trained_metrics['mean_malformed_actions']:.2f}",
                 f"- Trained disambiguation rate: {trained_metrics['disambiguation_rate']:.2%}",
                 f"- Trained guardrail violation rate: {trained_metrics['guardrail_violation_rate']:.2%}",
@@ -779,6 +844,26 @@ def main() -> None:
     trained_policy_fn = make_model_policy(model, tokenizer, config)
 
     eval_seeds = config.eval_seeds if not args.smoke else config.eval_seeds[: args.smoke_eval_seeds]
+    action_benchmark = benchmark_action_format(
+        model,
+        tokenizer,
+        config,
+        eval_seeds,
+        sample=True,
+    )
+    benchmark_path = output_dir / "action_format_benchmark.json"
+    benchmark_path.write_text(json.dumps(action_benchmark, indent=2, default=str))
+    print(
+        "Pre-train action benchmark:",
+        json.dumps(
+            {
+                "valid_json_rate": round(action_benchmark["valid_json_rate"], 4),
+                "valid_tool_rate": round(action_benchmark["valid_tool_rate"], 4),
+                "malformed_rate": round(action_benchmark["malformed_rate"], 4),
+            },
+            indent=2,
+        ),
+    )
     random_before = evaluate_policy(random_policy_fn, eval_seeds, config.max_tool_calls_per_episode)
     heuristic_ref = evaluate_policy(heuristic_policy_fn, eval_seeds, config.max_tool_calls_per_episode)
 
@@ -797,7 +882,7 @@ def main() -> None:
     if not args.smoke:
         write_metrics_csv(reward_rows, csv_path)
         plot_training_outputs(reward_rows, random_before, trained_after, heuristic_ref, output_dir)
-    write_eval_report(random_before, trained_after, heuristic_ref, reward_rows, output_dir)
+    write_eval_report(random_before, trained_after, heuristic_ref, action_benchmark, reward_rows, output_dir)
 
     if args.smoke:
         print("Smoke per-step rewards:", [round(row["mean_reward"], 4) for row in reward_rows])
@@ -809,6 +894,9 @@ def main() -> None:
         "random_mean_reward": random_before["mean_reward"],
         "trained_mean_reward": trained_after["mean_reward"],
         "heuristic_mean_reward": heuristic_ref["mean_reward"],
+        "pretrain_valid_json_rate": action_benchmark["valid_json_rate"],
+        "pretrain_valid_tool_rate": action_benchmark["valid_tool_rate"],
+        "action_benchmark_path": str(benchmark_path),
         "csv_path": str(csv_path if not args.smoke else ""),
         "plots_saved": not args.smoke,
     }
