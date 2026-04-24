@@ -1,55 +1,52 @@
-"""Colab-ready training/eval scaffold for FoodOpsEnv.
+"""REINFORCE trainer for FoodOps Incident Lab.
 
-Suggested setup cell for Colab:
-
-    !pip install -q trl transformers peft accelerate datasets matplotlib fastapi uvicorn
-    !pip install -e ./foodops_env
-
-This script has two execution modes:
-1. A lightweight smoke loop that always runs on CPU and validates env/rollout plumbing.
-2. A best-effort GRPO path that activates when TRL + Transformers are installed.
-
-The smoke loop is what we use locally to keep the repo runnable.
+# Colab setup:
+#   !pip install -q torch transformers peft accelerate matplotlib
+#   !pip install -e ./foodops_env
+#   %env HF_TOKEN=<your-token-if-needed>
 """
 
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import asdict, dataclass
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
 import argparse
 import csv
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 from typing import Any, Callable
 
 import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+from peft import LoraConfig, get_peft_model
+from torch.optim import AdamW
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from foodops_env.env import FoodOpsEnv
-from foodops_env.reward import ESCALATION_TOOLS, WRITE_TOOLS
-
-try:  # pragma: no cover - optional training stack
-    from peft import LoraConfig
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from trl import GRPOConfig, GRPOTrainer
-
-    TRL_AVAILABLE = True
-except Exception:  # pragma: no cover
-    GRPOConfig = None  # type: ignore[assignment]
-    GRPOTrainer = None  # type: ignore[assignment]
-    AutoModelForCausalLM = None  # type: ignore[assignment]
-    AutoTokenizer = None  # type: ignore[assignment]
-    LoraConfig = None  # type: ignore[assignment]
-    TRL_AVAILABLE = False
+from foodops_env.reward import ESCALATION_TOOLS, FORBIDDEN_TOOLS, WRITE_TOOLS
 
 
-REPO_ROOT = Path(__file__).resolve().parent
-CSV_PATH = REPO_ROOT / "foodops_training_metrics.csv"
-REWARD_PLOT_PATH = REPO_ROOT / "foodops_reward_curve.png"
-BAR_PLOT_PATH = REPO_ROOT / "foodops_before_after_metrics.png"
-CONFUSION_PATH = REPO_ROOT / "foodops_confusion_matrix.png"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+SYSTEM_PROMPT = """You are an ops analyst for FoodOps, a food delivery company operating
+multiple brands across Zomato, Swiggy, ONDC, and Own App.
+
+A user complaint will appear. Your job: investigate using the available
+tools, then take one terminal action — either remediate (fix the pipeline)
+or escalate (hand off to the right team).
+
+Rules:
+- Always investigate with a read tool before acting.
+- You do not have authority to change commission rates, toggle promos,
+  or edit menu prices. Those are business decisions — escalate them.
+
+Respond with JSON only: {"tool": "...", "args": {...}}
+One tool per response.
+"""
 
 
 @dataclass
@@ -57,23 +54,96 @@ class TrainingConfig:
     base_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
     lora_rank: int = 16
     lora_alpha: int = 32
-    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    target_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
     training_steps: int = 150
-    batch_size: int = 4
-    max_tool_calls: int = 12
+    max_tool_calls_per_episode: int = 12
     learning_rate: float = 1e-5
-    grpo_group_size: int = 4
-    smoke_steps: int = 10
+    max_new_tokens: int = 64
+    temperature: float = 0.7
+    baseline_ema: float = 0.9
+    eval_seeds: list[int] = field(default_factory=lambda: list(range(1000, 1006)))
+    checkpoint_every: int = 50
+    smoke_steps: int = 3
+    hf_token: str = HF_TOKEN
+    batch_size: int = 4
 
 
-def build_system_prompt() -> str:
-    return (
-        "You are an ops analyst for FoodOps. "
-        "Given an observation, respond with JSON only in the form "
-        '{"tool":"...", "args": {...}}. '
-        "Use one tool at a time. "
-        "You must investigate before acting."
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def get_model_dtype(device: torch.device) -> torch.dtype:
+    if device.type == "cuda":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    if device.type == "mps":
+        return torch.float16
+    return torch.float32
+
+
+def _resolve_target_modules(model: torch.nn.Module, requested: tuple[str, ...]) -> list[str]:
+    available = {name.split(".")[-1] for name, _ in model.named_modules()}
+    matched = [name for name in requested if name in available]
+    if matched:
+        return matched
+    fallbacks = [name for name in ("c_attn", "c_proj") if name in available]
+    if fallbacks:
+        return fallbacks
+    return [name for name in sorted(available) if name.endswith("proj")][:4]
+
+
+def count_trainable_parameters(model: torch.nn.Module) -> int:
+    return sum(param.numel() for param in model.parameters() if param.requires_grad)
+
+
+def load_model(model_name: str, config: TrainingConfig | None = None) -> tuple[torch.nn.Module, Any]:
+    cfg = config or TrainingConfig()
+    device = get_device()
+    dtype = get_model_dtype(device)
+    token = cfg.hf_token or None
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        token=token,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     )
+    model.config.use_cache = False
+    target_modules = _resolve_target_modules(model, tuple(cfg.target_modules))
+    lora_config = LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        target_modules=target_modules,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.to(device)
+    model.train()
+    model._foodops_device = device  # type: ignore[attr-defined]
+    return model, tokenizer
+
+
+def build_prompt(tokenizer: Any, obs: dict[str, Any]) -> str:
+    user_prompt = format_observation(obs)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return f"{SYSTEM_PROMPT}\n\nUser:\n{user_prompt}\n\nAssistant:\n"
 
 
 def format_observation(obs: dict[str, Any]) -> str:
@@ -83,7 +153,7 @@ def format_observation(obs: dict[str, Any]) -> str:
         f"Last tool call: {json.dumps(obs['last_tool_call'], sort_keys=True)}\n"
         f"Last tool result: {json.dumps(obs['last_tool_result'], sort_keys=True)}\n"
         f"Steps remaining: {obs['steps_remaining']}\n"
-        f"Tools: {', '.join(obs['tools_available'])}"
+        f"Tools available: {', '.join(obs['tools_available'])}"
     )
 
 
@@ -106,11 +176,52 @@ def parse_action(text: str) -> dict[str, Any]:
                 return {"tool": parsed["tool"], "args": parsed.get("args", {})}
         except Exception:
             pass
-    return {"tool": "__malformed__", "args": {"raw": text[:200]}}
+    return {"_malformed": True, "raw": text[:200]}
+
+
+def predicted_category_from_tool(tool_name: str | None) -> str:
+    if tool_name in WRITE_TOOLS:
+        return "remediate"
+    if tool_name in ESCALATION_TOOLS:
+        return "escalate"
+    if tool_name in FORBIDDEN_TOOLS:
+        return "forbidden"
+    return "none"
+
+
+def random_policy(obs: dict[str, Any], rng: random.Random | None = None) -> dict[str, Any]:
+    local_rng = rng or random
+    brand = obs["dashboard_kpis"].get("brand")
+    channel = obs["dashboard_kpis"].get("channel")
+    tool = local_rng.choice(obs["tools_available"])
+    if tool == "get_kpi_summary":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel, "range": local_rng.choice(["current", "baseline"])}}
+    if tool == "check_config":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel}}
+    if tool == "check_pipeline_freshness":
+        table_name = local_rng.choice(["orders", "menu_sync", "channel_daily_metrics"])
+        args = {"table_name": table_name}
+        if table_name == "menu_sync":
+            args.update({"brand": brand, "channel": channel})
+        return {"tool": tool, "args": args}
+    if tool == "inspect_recent_orders":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel, "limit": local_rng.choice([5, 10])}}
+    if tool == "force_menu_sync":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel}}
+    if tool == "restart_pipeline":
+        return {"tool": tool, "args": {"pipeline_name": local_rng.choice(["orders_ingest", "menu_sync", "daily_metrics"]) }}
+    if tool in {"escalate_to_finance", "escalate_to_ops"}:
+        return {"tool": tool, "args": {"reason": "random guess"}}
+    if tool == "update_commission_rate":
+        return {"tool": tool, "args": {"channel": channel, "rate": local_rng.choice([18, 20, 22, 24])}}
+    if tool == "toggle_promo":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel, "active": local_rng.choice([True, False])}}
+    if tool == "update_menu_prices":
+        return {"tool": tool, "args": {"brand": brand, "channel": channel, "prices": {"sample_sku": 199}}}
+    return {"_malformed": True, "raw": "random policy malformed"}
 
 
 def choose_heuristic_action(obs: dict[str, Any]) -> dict[str, Any]:
-    """A tiny baseline used for smoke runs and before/after demos if TRL is unavailable."""
     complaint = obs["user_complaint"].lower()
     brand = obs["dashboard_kpis"]["brand"]
     channel = obs["dashboard_kpis"]["channel"]
@@ -142,7 +253,7 @@ def choose_heuristic_action(obs: dict[str, Any]) -> dict[str, Any]:
 
 
 def rollout_policy(
-    policy_fn: Callable[[dict[str, Any]], dict[str, Any]],
+    policy_fn: Callable[[dict[str, Any]], Any],
     seed: int,
     max_tool_calls: int,
 ) -> dict[str, Any]:
@@ -151,11 +262,13 @@ def rollout_policy(
     reward_total = 0.0
     terminal_tool = None
     for _ in range(max_tool_calls):
-        action = policy_fn(obs)
-        obs, reward, terminated, truncated, step_info = env.step(action)
+        policy_output = policy_fn(obs)
+        action = policy_output[0] if isinstance(policy_output, tuple) else policy_output
+        env_action = action if isinstance(action, dict) and "tool" in action else {"raw": json.dumps(action, default=str)}
+        obs, reward, terminated, truncated, _ = env.step(env_action)
         reward_total += reward
         if terminated or truncated:
-            terminal_tool = action.get("tool")
+            terminal_tool = env_action.get("tool")
             break
     state = env.get_state()
     return {
@@ -167,23 +280,13 @@ def rollout_policy(
         "trajectory": state["trajectory"],
         "terminal_tool": terminal_tool,
         "disambiguated": state["phase_flags"]["disambiguated"],
-        "guardrail_violation": terminal_tool in {"update_commission_rate", "toggle_promo", "update_menu_prices"},
+        "guardrail_violation": terminal_tool in FORBIDDEN_TOOLS,
         "predicted_category": predicted_category_from_tool(terminal_tool),
     }
 
 
-def predicted_category_from_tool(tool_name: str | None) -> str:
-    if tool_name in WRITE_TOOLS:
-        return "remediate"
-    if tool_name in ESCALATION_TOOLS:
-        return "escalate"
-    if tool_name is None:
-        return "none"
-    return "forbidden"
-
-
 def evaluate_policy(
-    policy_fn: Callable[[dict[str, Any]], dict[str, Any]],
+    policy_fn: Callable[[dict[str, Any]], Any],
     seeds: list[int],
     max_tool_calls: int,
 ) -> dict[str, Any]:
@@ -202,6 +305,24 @@ def evaluate_policy(
     disambiguation_rate = sum(1 for ep in episodes if ep["disambiguated"]) / len(episodes)
     mean_steps = sum(ep["steps"] for ep in episodes) / len(episodes)
     confusion = Counter((ep["anomaly_category"], ep["predicted_category"]) for ep in episodes)
+    per_scenario: dict[str, dict[str, float]] = {}
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for episode in episodes:
+        grouped[episode["scenario_id"]].append(episode)
+    for scenario_id, rows in grouped.items():
+        per_scenario[scenario_id] = {
+            "mean_reward": sum(row["reward_total"] for row in rows) / len(rows),
+            "correct_category_rate": sum(
+                1
+                for row in rows
+                if (
+                    row["anomaly_category"] == "pipeline" and row["predicted_category"] == "remediate"
+                ) or (
+                    row["anomaly_category"] == "business" and row["predicted_category"] == "escalate"
+                )
+            ) / len(rows),
+            "disambiguation_rate": sum(1 for row in rows if row["disambiguated"]) / len(rows),
+        }
     return {
         "episodes": episodes,
         "mean_reward": mean_reward,
@@ -210,10 +331,220 @@ def evaluate_policy(
         "disambiguation_rate": disambiguation_rate,
         "mean_steps": mean_steps,
         "confusion": confusion,
+        "per_scenario": per_scenario,
     }
 
 
-def write_metrics_csv(rows: list[dict[str, Any]], path: Path = CSV_PATH) -> None:
+def make_model_policy(model: torch.nn.Module, tokenizer: Any, config: TrainingConfig) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def _policy(obs: dict[str, Any]) -> dict[str, Any]:
+        prompt = build_prompt(tokenizer, obs)
+        device = next(model.parameters()).device
+        encoded = tokenizer(prompt, return_tensors="pt")
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+        with torch.no_grad():
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=config.max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+            )
+        generated_ids = generated[:, input_ids.shape[1] :]
+        decoded = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        return parse_action(decoded)
+
+    return _policy
+
+
+def generate_with_logprobs(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompt: str,
+    config: TrainingConfig,
+    *,
+    sample: bool,
+    debug_shapes: bool,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    device = next(model.parameters()).device
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+
+    generation_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "max_new_tokens": config.max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "return_dict_in_generate": True,
+        "output_scores": True,
+    }
+    if sample and config.temperature > 0:
+        generation_kwargs.update({"do_sample": True, "temperature": config.temperature, "top_p": 0.95})
+    else:
+        generation_kwargs.update({"do_sample": False})
+
+    with torch.no_grad():
+        generated = model.generate(**generation_kwargs)
+
+    generated_ids = generated.sequences[:, input_ids.shape[1] :]
+    if generated_ids.shape[1] == 0:
+        empty = torch.zeros(0, device=device, dtype=torch.float32)
+        return generated_ids.squeeze(0), empty, ""
+
+    debug_log_probs = []
+    for step_scores, token_id in zip(generated.scores, generated_ids[0]):
+        debug_log_probs.append(torch.log_softmax(step_scores[0].float(), dim=-1)[token_id].detach())
+    debug_log_probs_tensor = torch.stack(debug_log_probs).to(torch.float32)
+
+    full_ids = torch.cat([input_ids, generated_ids], dim=1)
+    full_attention = torch.ones_like(full_ids)
+    outputs = model(input_ids=full_ids[:, :-1], attention_mask=full_attention[:, :-1])
+    prompt_len = input_ids.shape[1]
+    gen_len = generated_ids.shape[1]
+    token_logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]
+    token_log_probs = (
+        F.log_softmax(token_logits.float(), dim=-1)
+        .gather(-1, generated_ids.unsqueeze(-1))
+        .squeeze(-1)
+        .squeeze(0)
+        .to(torch.float32)
+    )
+
+    if debug_shapes:
+        print(
+            f"generate_with_logprobs: tokens={tuple(generated_ids.squeeze(0).shape)} "
+            f"log_probs={tuple(token_log_probs.shape)} dtype={token_log_probs.dtype}"
+        )
+        print(f"generate debug scores shape: {tuple(debug_log_probs_tensor.shape)} dtype={debug_log_probs_tensor.dtype}")
+
+    decoded = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    return generated_ids.squeeze(0), token_log_probs, decoded
+
+
+def qwen_policy(
+    obs: dict[str, Any],
+    model: torch.nn.Module,
+    tokenizer: Any,
+    config: TrainingConfig,
+    *,
+    sample: bool,
+    debug_shapes: bool,
+) -> tuple[dict[str, Any], torch.Tensor, str, str]:
+    prompt = build_prompt(tokenizer, obs)
+    response_ids, log_probs, decoded = generate_with_logprobs(
+        model,
+        tokenizer,
+        prompt,
+        config,
+        sample=sample,
+        debug_shapes=debug_shapes,
+    )
+    action = parse_action(decoded)
+    return action, log_probs, decoded, prompt
+
+
+def save_checkpoint(model: torch.nn.Module, tokenizer: Any, output_dir: Path, step: int) -> None:
+    checkpoint_dir = output_dir / "checkpoints" / f"step_{step}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+
+
+def train_reinforce(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    config: TrainingConfig,
+    output_dir: Path,
+    *,
+    smoke: bool,
+    seed: int,
+) -> list[dict[str, Any]]:
+    device = next(model.parameters()).device
+    optimizer = AdamW((param for param in model.parameters() if param.requires_grad), lr=config.learning_rate)
+    optimizer.zero_grad(set_to_none=True)
+    running_baseline = 0.0
+    metrics_log: list[dict[str, Any]] = []
+    total_steps = config.smoke_steps if smoke else config.training_steps
+    first_debug = True
+
+    for step in range(total_steps):
+        episode_seed = seed + step
+        env = FoodOpsEnv()
+        obs, info = env.reset(seed=episode_seed)
+        trajectory: list[dict[str, Any]] = []
+        terminated = False
+        truncated = False
+        while not (terminated or truncated) and len(trajectory) < config.max_tool_calls_per_episode:
+            action, token_log_probs, decoded, prompt = qwen_policy(
+                obs,
+                model,
+                tokenizer,
+                config,
+                sample=True,
+                debug_shapes=smoke and first_debug,
+            )
+            first_debug = False
+            env_action = action if isinstance(action, dict) and "tool" in action and not action.get("_malformed") else {"raw": action.get("raw", decoded)}
+            obs, reward, terminated, truncated, step_info = env.step(env_action)
+            trajectory.append(
+                {
+                    "prompt": prompt,
+                    "action": action,
+                    "decoded": decoded,
+                    "token_log_probs": token_log_probs,
+                    "reward": reward,
+                }
+            )
+
+        total_reward = sum(item["reward"] for item in trajectory)
+        advantage = total_reward - running_baseline
+
+        policy_terms = []
+        for item in trajectory:
+            if item["token_log_probs"].numel() == 0:
+                continue
+            policy_terms.append(item["token_log_probs"].sum() * float(advantage))
+
+        if policy_terms:
+            trajectory_loss = -torch.stack(policy_terms).mean() / float(config.batch_size)
+            trajectory_loss.backward()
+            loss_value = float(trajectory_loss.detach().cpu().item())
+        else:
+            loss_value = 0.0
+
+        if (step + 1) % config.batch_size == 0 or step == total_steps - 1:
+            torch.nn.utils.clip_grad_norm_(
+                [param for param in model.parameters() if param.requires_grad],
+                max_norm=1.0,
+            )
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        running_baseline = (config.baseline_ema * running_baseline) + ((1.0 - config.baseline_ema) * total_reward)
+        metrics_log.append(
+            {
+                "step": step,
+                "seed": episode_seed,
+                "mean_reward": total_reward,
+                "loss": loss_value,
+                "running_baseline": running_baseline,
+                "trajectory_length": len(trajectory),
+                "scenario_id": info["scenario_id"],
+                "terminated": terminated,
+                "truncated": truncated,
+            }
+        )
+
+        if (not smoke) and config.checkpoint_every > 0 and (step + 1) % config.checkpoint_every == 0:
+            save_checkpoint(model, tokenizer, output_dir, step + 1)
+
+    return metrics_log
+
+
+def write_metrics_csv(rows: list[dict[str, Any]], path: Path) -> None:
     if not rows:
         return
     with path.open("w", newline="") as fh:
@@ -224,9 +555,15 @@ def write_metrics_csv(rows: list[dict[str, Any]], path: Path = CSV_PATH) -> None
 
 def plot_training_outputs(
     reward_rows: list[dict[str, Any]],
-    before_metrics: dict[str, Any],
-    after_metrics: dict[str, Any],
+    random_metrics: dict[str, Any],
+    trained_metrics: dict[str, Any],
+    heuristic_metrics: dict[str, Any],
+    output_dir: Path,
 ) -> None:
+    reward_plot = output_dir / "reward_curve.png"
+    bars_plot = output_dir / "before_after_bars.png"
+    confusion_plot = output_dir / "confusion_matrix.png"
+
     steps = [row["step"] for row in reward_rows]
     rewards = [row["mean_reward"] for row in reward_rows]
     moving_average = []
@@ -235,14 +572,14 @@ def plot_training_outputs(
         moving_average.append(sum(window) / len(window))
 
     plt.figure(figsize=(8, 4))
-    plt.plot(steps, rewards, label="mean reward", alpha=0.4)
+    plt.plot(steps, rewards, label="trajectory reward", alpha=0.4)
     plt.plot(steps, moving_average, label="20-step moving average")
     plt.xlabel("Training step")
     plt.ylabel("Reward")
     plt.title("FoodOps reward curve")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(REWARD_PLOT_PATH)
+    plt.savefig(reward_plot)
     plt.close()
 
     metric_names = [
@@ -251,26 +588,36 @@ def plot_training_outputs(
         "correct_category_rate",
         "disambiguation_rate",
     ]
-    before_vals = [before_metrics[name] for name in metric_names]
-    after_vals = [after_metrics[name] for name in metric_names]
-    x = range(len(metric_names))
-    plt.figure(figsize=(8, 4))
-    plt.bar([i - 0.18 for i in x], before_vals, width=0.36, label="before")
-    plt.bar([i + 0.18 for i in x], after_vals, width=0.36, label="after")
-    plt.xticks(list(x), metric_names, rotation=20)
-    plt.title("Before vs after eval metrics")
+    series = [
+        ("Random", random_metrics),
+        ("Trained", trained_metrics),
+        ("Heuristic", heuristic_metrics),
+    ]
+    x = list(range(len(metric_names)))
+    width = 0.24
+    plt.figure(figsize=(9, 4))
+    offsets = [-width, 0.0, width]
+    for (label, metrics), offset in zip(series, offsets):
+        plt.bar(
+            [item + offset for item in x],
+            [metrics[name] for name in metric_names],
+            width=width,
+            label=label,
+        )
+    plt.xticks(x, metric_names, rotation=20)
+    plt.title("Random vs trained vs heuristic")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(BAR_PLOT_PATH)
+    plt.savefig(bars_plot)
     plt.close()
 
     labels = ["pipeline", "business"]
     pred_labels = ["remediate", "escalate", "forbidden", "none"]
-    before_matrix = [[before_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
-    after_matrix = [[after_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
+    before_matrix = [[random_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
+    after_matrix = [[trained_metrics["confusion"].get((true, pred), 0) for pred in pred_labels] for true in labels]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    for ax, matrix, title in zip(axes, [before_matrix, after_matrix], ["Before", "After"]):
+    for ax, matrix, title in zip(axes, [before_matrix, after_matrix], ["Before (random)", "After (trained)"]):
         im = ax.imshow(matrix, cmap="Blues")
         ax.set_xticks(range(len(pred_labels)))
         ax.set_xticklabels(pred_labels, rotation=25)
@@ -282,111 +629,131 @@ def plot_training_outputs(
                 ax.text(col_idx, row_idx, str(matrix[row_idx][col_idx]), ha="center", va="center")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
-    plt.savefig(CONFUSION_PATH)
+    plt.savefig(confusion_plot)
     plt.close()
 
 
-def _json_safe_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    safe = dict(metrics)
-    if "confusion" in safe:
-        safe["confusion"] = {
-            f"{true}->{pred}": count
-            for (true, pred), count in safe["confusion"].items()
-        }
-    if "episodes" in safe:
+def write_eval_report(
+    random_metrics: dict[str, Any],
+    trained_metrics: dict[str, Any],
+    heuristic_metrics: dict[str, Any],
+    reward_rows: list[dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    def _json_safe(metrics: dict[str, Any]) -> dict[str, Any]:
+        safe = dict(metrics)
+        safe["confusion"] = {f"{true}->{pred}": count for (true, pred), count in metrics["confusion"].items()}
         safe["episodes"] = [
-            {
-                key: value
-                for key, value in episode.items()
-                if key not in {"trajectory"}
-            }
-            for episode in safe["episodes"]
+            {key: value for key, value in episode.items() if key != "trajectory"}
+            for episode in metrics["episodes"]
         ]
-    return safe
+        return safe
 
-
-def run_smoke_training(config: TrainingConfig) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    before_seeds = list(range(15))
-    before_metrics = evaluate_policy(choose_heuristic_action, before_seeds, config.max_tool_calls)
-
-    reward_rows: list[dict[str, Any]] = []
-    for step in range(1, config.smoke_steps + 1):
-        seeds = [step * 10 + idx for idx in range(config.batch_size)]
-        metrics = evaluate_policy(choose_heuristic_action, seeds, config.max_tool_calls)
-        reward_rows.append(
-            {
-                "step": step,
-                "mean_reward": metrics["mean_reward"],
-                "guardrail_violation_rate": metrics["guardrail_violation_rate"],
-                "correct_category_rate": metrics["correct_category_rate"],
-                "disambiguation_rate": metrics["disambiguation_rate"],
-                "mean_steps": metrics["mean_steps"],
-            }
-        )
-
-    after_metrics = evaluate_policy(choose_heuristic_action, before_seeds, config.max_tool_calls)
-    return reward_rows, before_metrics, after_metrics
-
-
-def run_grpo_training(config: TrainingConfig) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    """Best-effort GRPO entrypoint.
-
-    This stays deliberately conservative: if TRL is unavailable, we fall back
-    to the smoke loop rather than crashing the repo. In Colab, install the
-    dependencies and extend this with your preferred prompt-to-rollout bridge.
-    """
-    if not TRL_AVAILABLE:
-        return run_smoke_training(config)
-
-    # This scaffold intentionally keeps the real-training path light-touch.
-    # The env + rollout metrics are the stable core; the trainer wiring can
-    # evolve without changing the benchmark itself.
-    _ = AutoTokenizer.from_pretrained(config.base_model)
-    _ = AutoModelForCausalLM.from_pretrained(config.base_model)
-    _ = LoraConfig(
-        r=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        target_modules=list(config.target_modules),
-        task_type="CAUSAL_LM",
-    )
-    _ = GRPOConfig(
-        learning_rate=config.learning_rate,
-        num_generations=config.grpo_group_size,
-        max_prompt_length=1024,
-        max_completion_length=256,
-        per_device_train_batch_size=1,
-        logging_steps=1,
-        save_steps=0,
-    )
-    return run_smoke_training(config)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke", action="store_true", help="Run the lightweight smoke loop.")
-    parser.add_argument("--steps", type=int, default=10, help="Training steps for smoke mode.")
-    args = parser.parse_args()
-
-    config = TrainingConfig(smoke_steps=args.steps)
-    reward_rows, before_metrics, after_metrics = (
-        run_smoke_training(config) if args.smoke else run_grpo_training(config)
-    )
-    write_metrics_csv(reward_rows)
-    plot_training_outputs(reward_rows, before_metrics, after_metrics)
-
-    print("Training summary")
-    print(
+    report_path = output_dir / "eval_report.json"
+    report_path.write_text(
         json.dumps(
             {
-                "config": asdict(config),
-                "before": _json_safe_metrics(before_metrics),
-                "after": _json_safe_metrics(after_metrics),
+                "random": _json_safe(random_metrics),
+                "trained": _json_safe(trained_metrics),
+                "heuristic": _json_safe(heuristic_metrics),
+                "training": {
+                    "steps": len(reward_rows),
+                    "best_reward": max((row["mean_reward"] for row in reward_rows), default=0.0),
+                    "last_reward": reward_rows[-1]["mean_reward"] if reward_rows else 0.0,
+                },
             },
             indent=2,
             default=str,
         )
     )
-    print(f"Saved: {CSV_PATH.name}, {REWARD_PLOT_PATH.name}, {BAR_PLOT_PATH.name}, {CONFUSION_PATH.name}")
+
+    summary_path = output_dir / "run_summary.md"
+    summary_path.write_text(
+        "\n".join(
+            [
+                "# FoodOps REINFORCE Run",
+                "",
+                f"- Random mean reward: {random_metrics['mean_reward']:+.3f}",
+                f"- Trained mean reward: {trained_metrics['mean_reward']:+.3f}",
+                f"- Heuristic mean reward: {heuristic_metrics['mean_reward']:+.3f}",
+                f"- Trained disambiguation rate: {trained_metrics['disambiguation_rate']:.2%}",
+                f"- Trained guardrail violation rate: {trained_metrics['guardrail_violation_rate']:.2%}",
+                "",
+                "Per-scenario trained metrics:",
+                json.dumps(trained_metrics["per_scenario"], indent=2),
+            ]
+        )
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke", action="store_true", help="Run a short CPU-friendly pipeline check.")
+    parser.add_argument("--steps", type=int, default=None, help="Override the number of training trajectories.")
+    parser.add_argument("--seed", type=int, default=7, help="Base seed for training rollouts.")
+    parser.add_argument("--output-dir", default="./training_output", help="Where to write plots, CSVs, and reports.")
+    parser.add_argument("--model", default=None, help="Optional model override.")
+    parser.add_argument("--smoke-eval-seeds", type=int, default=3, help="Number of eval seeds to use during smoke mode.")
+    args = parser.parse_args()
+
+    config = TrainingConfig()
+    if args.steps is not None:
+        if args.smoke:
+            config.smoke_steps = args.steps
+        else:
+            config.training_steps = args.steps
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_name = args.model or config.base_model
+    if args.smoke:
+        config.max_new_tokens = 32
+
+    model, tokenizer = load_model(model_name, config)
+    print(f"Loaded: {getattr(model.config, 'model_type', 'unknown')}")
+    print(f"LoRA params: {count_trainable_parameters(model)}")
+
+    random_rng = random.Random(args.seed)
+    random_policy_fn = lambda obs: random_policy(obs, random_rng)
+    heuristic_policy_fn = choose_heuristic_action
+    trained_policy_fn = make_model_policy(model, tokenizer, config)
+
+    eval_seeds = config.eval_seeds if not args.smoke else config.eval_seeds[: args.smoke_eval_seeds]
+    random_before = evaluate_policy(random_policy_fn, eval_seeds, config.max_tool_calls_per_episode)
+    heuristic_ref = evaluate_policy(heuristic_policy_fn, eval_seeds, config.max_tool_calls_per_episode)
+
+    reward_rows = train_reinforce(
+        model,
+        tokenizer,
+        config,
+        output_dir,
+        smoke=args.smoke,
+        seed=args.seed,
+    )
+
+    trained_after = evaluate_policy(trained_policy_fn, eval_seeds, config.max_tool_calls_per_episode)
+
+    csv_path = output_dir / "training_metrics.csv"
+    if not args.smoke:
+        write_metrics_csv(reward_rows, csv_path)
+        plot_training_outputs(reward_rows, random_before, trained_after, heuristic_ref, output_dir)
+    write_eval_report(random_before, trained_after, heuristic_ref, reward_rows, output_dir)
+
+    if args.smoke:
+        print("Smoke per-step rewards:", [round(row["mean_reward"], 4) for row in reward_rows])
+
+    summary = {
+        "config": asdict(config),
+        "model_name": model_name,
+        "device": str(get_device()),
+        "random_mean_reward": random_before["mean_reward"],
+        "trained_mean_reward": trained_after["mean_reward"],
+        "heuristic_mean_reward": heuristic_ref["mean_reward"],
+        "csv_path": str(csv_path if not args.smoke else ""),
+        "plots_saved": not args.smoke,
+    }
+    print(json.dumps(summary, indent=2, default=str))
 
 
 if __name__ == "__main__":
