@@ -129,6 +129,10 @@ def load_model(model_name: str, config: TrainingConfig | None = None) -> tuple[t
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     model.to(device)
     model.train()
     model._foodops_device = device  # type: ignore[attr-defined]
@@ -399,29 +403,43 @@ def generate_with_logprobs(
         debug_log_probs.append(torch.log_softmax(step_scores[0].float(), dim=-1)[token_id].detach())
     debug_log_probs_tensor = torch.stack(debug_log_probs).to(torch.float32)
 
-    full_ids = torch.cat([input_ids, generated_ids], dim=1)
-    full_attention = torch.ones_like(full_ids)
-    outputs = model(input_ids=full_ids[:, :-1], attention_mask=full_attention[:, :-1])
-    prompt_len = input_ids.shape[1]
-    gen_len = generated_ids.shape[1]
-    token_logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]
-    token_log_probs = (
-        F.log_softmax(token_logits.float(), dim=-1)
-        .gather(-1, generated_ids.unsqueeze(-1))
-        .squeeze(-1)
-        .squeeze(0)
-        .to(torch.float32)
-    )
-
     if debug_shapes:
         print(
             f"generate_with_logprobs: tokens={tuple(generated_ids.squeeze(0).shape)} "
-            f"log_probs={tuple(token_log_probs.shape)} dtype={token_log_probs.dtype}"
+            f"log_probs={tuple(debug_log_probs_tensor.shape)} dtype={debug_log_probs_tensor.dtype}"
         )
         print(f"generate debug scores shape: {tuple(debug_log_probs_tensor.shape)} dtype={debug_log_probs_tensor.dtype}")
 
     decoded = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    return generated_ids.squeeze(0), token_log_probs, decoded
+    return generated_ids.squeeze(0), debug_log_probs_tensor, decoded
+
+
+def compute_response_logprobs(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompt: str,
+    response_token_ids: list[int],
+) -> torch.Tensor:
+    device = next(model.parameters()).device
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    response_ids = torch.tensor(response_token_ids, device=device, dtype=torch.long).unsqueeze(0)
+    if response_ids.shape[1] == 0:
+        return torch.zeros(0, device=device, dtype=torch.float32)
+
+    full_ids = torch.cat([input_ids, response_ids], dim=1)
+    full_attention = torch.ones_like(full_ids)
+    outputs = model(input_ids=full_ids[:, :-1], attention_mask=full_attention[:, :-1])
+    prompt_len = input_ids.shape[1]
+    gen_len = response_ids.shape[1]
+    token_logits = outputs.logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]
+    return (
+        F.log_softmax(token_logits.float(), dim=-1)
+        .gather(-1, response_ids.unsqueeze(-1))
+        .squeeze(-1)
+        .squeeze(0)
+        .to(torch.float32)
+    )
 
 
 def qwen_policy(
@@ -443,7 +461,7 @@ def qwen_policy(
         debug_shapes=debug_shapes,
     )
     action = parse_action(decoded)
-    return action, log_probs, decoded, prompt
+    return action, response_ids, decoded, prompt
 
 
 def save_checkpoint(model: torch.nn.Module, tokenizer: Any, output_dir: Path, step: int) -> None:
@@ -478,7 +496,7 @@ def train_reinforce(
         terminated = False
         truncated = False
         while not (terminated or truncated) and len(trajectory) < config.max_tool_calls_per_episode:
-            action, token_log_probs, decoded, prompt = qwen_policy(
+            action, response_ids, decoded, prompt = qwen_policy(
                 obs,
                 model,
                 tokenizer,
@@ -494,24 +512,31 @@ def train_reinforce(
                     "prompt": prompt,
                     "action": action,
                     "decoded": decoded,
-                    "token_log_probs": token_log_probs,
+                    "response_token_ids": response_ids.detach().cpu().tolist(),
                     "reward": reward,
                 }
             )
 
         total_reward = sum(item["reward"] for item in trajectory)
         advantage = total_reward - running_baseline
-
-        policy_terms = []
-        for item in trajectory:
-            if item["token_log_probs"].numel() == 0:
-                continue
-            policy_terms.append(item["token_log_probs"].sum() * float(advantage))
-
-        if policy_terms:
-            trajectory_loss = -torch.stack(policy_terms).mean() / float(config.batch_size)
-            trajectory_loss.backward()
-            loss_value = float(trajectory_loss.detach().cpu().item())
+        valid_items = [item for item in trajectory if item["response_token_ids"]]
+        if valid_items:
+            loss_total = 0.0
+            scale = -float(advantage) / (len(valid_items) * float(config.batch_size))
+            for item in valid_items:
+                token_log_probs = compute_response_logprobs(
+                    model,
+                    tokenizer,
+                    item["prompt"],
+                    item["response_token_ids"],
+                )
+                step_loss = token_log_probs.sum() * scale
+                step_loss.backward()
+                loss_total += float(step_loss.detach().cpu().item())
+                del token_log_probs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            loss_value = loss_total
         else:
             loss_value = 0.0
 
